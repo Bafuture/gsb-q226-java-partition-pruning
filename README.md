@@ -19,6 +19,60 @@ Pair-wise GSB 标注任务仓库（第 15 批 / 226）。
 ./mvnw -q verify
 ```
 
+## 实现说明
+
+代码位于 `com.example.gsb.partition` 包：
+
+| 类 | 职责 |
+|----|------|
+| `Row` | 一行数据：`rowId`（去重键）、`partitionKey`（分区键）、`sortKey`（分区内索引键）、`payload` |
+| `Partitioner` | 分区策略接口：分区键 → 分区 id，并给出该分区覆盖的键区间 |
+| `RangePartitioner` | 按连续等宽区间分区（如 width=30 且分区键为 epoch day 即按月分区） |
+| `HashPartitioner` | 按 `key % 桶数` 哈希分区，各桶覆盖整个键域 |
+| `Partition` | 单个分区，持有自己的有序索引 `TreeMap<sortKey, rows>`，支持点查/范围扫描/清空/统计 |
+| `PartitionedTable` | 分区表：写入路由、显式新增/删除分区、查询裁剪、分区内查询、跨分区合并去重、元数据统计 |
+| `Query` / `QueryResult` / `PartitionStats` | 查询条件、结果（含裁剪前后分区数）、分区统计 |
+
+查询执行流程：**分区裁剪**（分区键点查定位唯一分区；范围条件只保留键区间相交的分区）→
+**分区内查询**（候选分区内对 `sortKey` 做点查或闭区间范围扫描，并再次应用分区键行级谓词）→
+**合并去重排序**（按 `rowId` 去重，结果按 `(sortKey, rowId)` 有序）。
+
+```java
+PartitionedTable table = new PartitionedTable(new RangePartitioner(30)); // 按月
+table.write(new Row(1, day, eventTime, payload));
+
+QueryResult r = table.query(Query.builder()
+        .partitionKeyRange(fromDay, toDay)   // 触发分区裁剪
+        .sortKeyRange(fromTime, toTime)      // 分区内范围查询
+        .build());
+r.partitionsBeforePruning();               // 裁剪前分区数
+r.partitionsAfterPruning();                // 实际扫描分区数
+r.rows();                                  // 跨分区合并、去重、有序的结果
+```
+
+## 分区键选择对裁剪效果的影响
+
+同一份 120 天的数据，在 4 分区表上分别用范围（按月）与哈希策略，查询一天的数据区间（第 10~40 天）：
+
+| 查询形态 | 日期范围分区 | 哈希分区 |
+|----------|--------------|----------|
+| 分区键范围查询 | 扫描 **2/4** 个分区（裁剪掉 50%） | 扫描 **4/4** 个分区（无法裁剪） |
+| 分区键点查 | 扫描 **1/4** 个分区 | 扫描 **1/4** 个分区 |
+| 无分区键条件 | 4/4 | 4/4 |
+
+结论：
+
+- 分区键应选择**查询谓词中高频出现、且天然有序/连续**的列（如时间）。范围分区让相邻键落入同一分区，
+  范围谓词可排除大部分分区；这正是时间分区表的典型收益。
+- 哈希分区的数据分布均匀、无热点，但每个桶都覆盖整个键域，**只有点查能裁剪**，范围谓词必须扫所有桶。
+  它适合按唯一键做等值查询的场景，不适合时间范围分析。
+- 分区不是越细越好：分区过细会让单查询命中过多分区、合并代价上升；过粗则单分区扫描量大。
+  应让分区粒度与典型查询的键范围匹配（如查询通常跨 1~2 个月，按月分区即可）。
+- 分区键一旦选定，查询若不带分区键谓词（或在分区键上用函数/无法下推的表达式），任何策略都无法裁剪。
+
+`PartitionKeyChoiceComparisonTest` 用断言固化了上述对比；`PartitionedTableTest`
+覆盖分区写入、裁剪生效、分区内点查/范围查、分区删除清理（含无悬挂引用）、跨分区合并去重与统计。
+
 ## 任务提示词
 
 以下为本题完整的 User Prompt 原文，两次执行必须使用完全相同的文本。
